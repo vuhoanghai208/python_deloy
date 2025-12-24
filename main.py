@@ -117,7 +117,7 @@ async def process_data(request: ChatRequest):
     for _ in range(len(GOOGLE_KEYS)):
         try:
             genai.configure(api_key=get_current_key())
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            model = genai.GenerativeModel('gemini-1.5-flash')
             response = model.generate_content(
                 f"{system_prompt}\n\n{final_prompt}"
             )
