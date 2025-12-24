@@ -5,7 +5,7 @@ import faiss
 import pickle
 import numpy as np
 import os
-import google.generativeai as genai
+from openai import OpenAI
 import time
 
 app = FastAPI()
@@ -18,24 +18,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Quản lý API Keys
-GOOGLE_KEYS_STR = os.getenv("GOOGLE_API_KEYS", "")
-GOOGLE_KEYS = [k.strip() for k in GOOGLE_KEYS_STR.split(",") if k.strip()]
-key_index = 0
+# 2. Cấu hình OpenAI Client
+# Lấy Key từ biến môi trường trên Render
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_current_key():
-    global key_index
-    if not GOOGLE_KEYS: return None
-    return GOOGLE_KEYS[key_index % len(GOOGLE_KEYS)]
-
-# --- QUAN TRỌNG: THÊM ROUTE NÀY ĐỂ SỬA LỖI 404 KHI PING ---
+# 3. API Health Check (Sửa lỗi 404 Ping)
 @app.get("/")
 def read_root():
-    return {"status": "Server is running", "message": "Hello from Render!"}
-# ---------------------------------------------------------
+    return {"status": "OpenAI Server is running"}
 
-# 3. Load Database Vector
-print("📥 Đang tải cơ sở dữ liệu luật (Local)...")
+# 4. Load Database (Bắt buộc phải là DB tạo bằng OpenAI)
+print("📥 Đang tải cơ sở dữ liệu luật...")
 index = None
 documents = None
 
@@ -46,32 +40,30 @@ try:
             documents = pickle.load(f)
         print(f"✅ Đã tải xong! Tổng cộng {len(documents)} đoạn luật.")
     else:
-        print("⚠️ Lỗi: Không tìm thấy file dữ liệu. Hãy chạy build_db.py trước!")
+        print("⚠️ Lỗi: Không tìm thấy file dữ liệu. Hãy đảm bảo bạn đã chạy build_db_openai.py!")
 except Exception as e:
     print(f"❌ Lỗi khi tải DB: {e}")
 
-# 4. Hàm chỉ tìm kiếm Vector
-def vector_search_only(query):
+# 5. Hàm tìm kiếm Vector (Dùng OpenAI Embeddings)
+def vector_search(query):
     if not index or not documents:
-        return "Hệ thống chưa có dữ liệu luật. Vui lòng liên hệ quản trị viên nạp dữ liệu."
+        return ""
 
     try:
-        genai.configure(api_key=get_current_key())
-        
-        # MODEL NÀY CỦA GOOGLE, KHÔNG PHẢI OPENAI - CODE ĐÚNG RỒI
-        res = genai.embed_content(
-            model="models/text-embedding-004",
-            content=query,
-            task_type="retrieval_query"
+        # Tạo vector từ câu hỏi của người dùng
+        response = client.embeddings.create(
+            input=query,
+            model="text-embedding-3-small"
         )
-        q_vec = np.array([res['embedding']]).astype('float32')
+        q_vec = np.array([response.data[0].embedding]).astype('float32')
         faiss.normalize_L2(q_vec) 
         
+        # Tìm 5 đoạn luật khớp nhất
         scores, indices = index.search(q_vec, 5)
         
         relevant_docs = []
         for i, score in enumerate(scores[0]):
-            if score >= 0.35: 
+            if score >= 0.35: # Ngưỡng lọc độ chính xác
                 relevant_docs.append(documents[indices[0][i]])
         
         if relevant_docs:
@@ -80,50 +72,53 @@ def vector_search_only(query):
             return ""
             
     except Exception as e:
-        print(f"Lỗi tìm kiếm Vector: {e}")
+        print(f"Lỗi tìm kiếm: {e}")
         return ""
 
-# 5. API Xử lý Chat
+# 6. API Xử lý Chat
 class ChatRequest(BaseModel):
     prompt: str
 
 @app.post("/api/process")
 async def process_data(request: ChatRequest):
     user_input = request.prompt
-    context = vector_search_only(user_input)
     
+    # Bước A: Tìm kiếm dữ liệu luật
+    context = vector_search(user_input)
+    
+    # Bước B: Xây dựng Prompt
     if context:
-        system_prompt = f"""
+        system_content = f"""
         Bạn là Trợ lý Pháp luật Giao thông Việt Nam (Nghị định 168/2024).
-        Dưới đây là thông tin trích xuất từ văn bản luật chính xác:
+        Dưới đây là thông tin trích xuất từ văn bản luật:
         ---------------------
         {context}
         ---------------------
         YÊU CẦU:
-        1. CHỈ sử dụng thông tin được cung cấp ở trên để trả lời.
-        2. Nếu thông tin có đề cập mức phạt tiền, hãy ghi rõ con số cụ thể.
-        3. Trả lời ngắn gọn, đi thẳng vào vấn đề.
+        1. CHỈ sử dụng thông tin trên để trả lời.
+        2. Ghi rõ mức phạt tiền cụ thể (nếu có).
+        3. Trả lời ngắn gọn, súc tích.
         """
-        final_prompt = f"Người dùng hỏi: {user_input}"
     else:
-        system_prompt = """
-        Bạn là Trợ lý Giao thông.
-        Người dùng đang hỏi một câu mà hệ thống dữ liệu luật hiện tại KHÔNG tìm thấy thông tin khớp.
-        Hãy trả lời khéo léo rằng: "Xin lỗi, hiện tại trong cơ sở dữ liệu của tôi chưa có thông tin cụ thể về vấn đề này. Bạn có thể hỏi rõ hơn về các lỗi vi phạm phổ biến không?"
+        system_content = """
+        Bạn là Trợ lý Giao thông. Hiện tại trong cơ sở dữ liệu không có thông tin về câu hỏi này.
+        Hãy khéo léo xin lỗi và gợi ý người dùng hỏi về các lỗi vi phạm phổ biến.
         """
-        final_prompt = f"Câu hỏi: {user_input}"
 
-    global key_index
-    for _ in range(len(GOOGLE_KEYS)):
-        try:
-            genai.configure(api_key=get_current_key())
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            response = model.generate_content(
-                f"{system_prompt}\n\n{final_prompt}"
-            )
-            return {"answer": response.text}
-        except:
-            key_index += 1
-            time.sleep(0.5)
-            
-    return {"answer": "Hệ thống đang bận, vui lòng thử lại sau giây lát."}
+    # Bước C: Gọi GPT-4o-mini để trả lời
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini", # Model bạn yêu cầu
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_input}
+            ],
+            temperature=0.3, # Giữ cho câu trả lời ổn định, ít bịa đặt
+            max_tokens=500
+        )
+        
+        return {"answer": response.choices[0].message.content}
+        
+    except Exception as e:
+        print(f"Lỗi OpenAI: {e}")
+        return {"answer": "Hệ thống đang bận, vui lòng thử lại sau."}
