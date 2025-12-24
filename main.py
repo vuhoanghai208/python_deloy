@@ -138,7 +138,7 @@ async def process_data(request: ChatRequest):
             genai.configure(api_key=current_key)
             
             # Dùng model 1.5-flash (Bản ổn định nhất hiện tại)
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            model = genai.GenerativeModel('gemini-2.5-flash')
             
             response = model.generate_content(f"{system_prompt}\n\n{final_prompt}")
             
