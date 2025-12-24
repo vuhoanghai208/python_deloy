@@ -4,3 +4,4 @@ faiss-cpu
 numpy
 google-generativeai
 duckduckgo_search
+openai
