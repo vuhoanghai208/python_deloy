@@ -28,7 +28,13 @@ def get_current_key():
     if not GOOGLE_KEYS: return None
     return GOOGLE_KEYS[key_index % len(GOOGLE_KEYS)]
 
-# 3. Load Database Vector (Chỉ load 1 lần khi khởi động)
+# --- QUAN TRỌNG: THÊM ROUTE NÀY ĐỂ SỬA LỖI 404 KHI PING ---
+@app.get("/")
+def read_root():
+    return {"status": "Server is running", "message": "Hello from Render!"}
+# ---------------------------------------------------------
+
+# 3. Load Database Vector
 print("📥 Đang tải cơ sở dữ liệu luật (Local)...")
 index = None
 documents = None
@@ -44,7 +50,7 @@ try:
 except Exception as e:
     print(f"❌ Lỗi khi tải DB: {e}")
 
-# 4. Hàm chỉ tìm kiếm Vector (Bỏ Online)
+# 4. Hàm chỉ tìm kiếm Vector
 def vector_search_only(query):
     if not index or not documents:
         return "Hệ thống chưa có dữ liệu luật. Vui lòng liên hệ quản trị viên nạp dữ liệu."
@@ -52,20 +58,17 @@ def vector_search_only(query):
     try:
         genai.configure(api_key=get_current_key())
         
-        # Mã hóa câu hỏi thành Vector
+        # MODEL NÀY CỦA GOOGLE, KHÔNG PHẢI OPENAI - CODE ĐÚNG RỒI
         res = genai.embed_content(
             model="models/text-embedding-004",
             content=query,
             task_type="retrieval_query"
         )
         q_vec = np.array([res['embedding']]).astype('float32')
-        faiss.normalize_L2(q_vec) # Chuẩn hóa để tính Cosine Similarity
+        faiss.normalize_L2(q_vec) 
         
-        # Tìm 5 đoạn luật khớp nhất
         scores, indices = index.search(q_vec, 5)
         
-        # Lọc kết quả: Chỉ lấy những đoạn có độ tương đồng > 0.35
-        # (Nếu thấp quá nghĩa là không liên quan -> Bỏ qua)
         relevant_docs = []
         for i, score in enumerate(scores[0]):
             if score >= 0.35: 
@@ -74,26 +77,22 @@ def vector_search_only(query):
         if relevant_docs:
             return "\n---\n".join(relevant_docs)
         else:
-            return "" # Không tìm thấy gì liên quan
+            return ""
             
     except Exception as e:
         print(f"Lỗi tìm kiếm Vector: {e}")
         return ""
 
-# 5. API Xử lý
+# 5. API Xử lý Chat
 class ChatRequest(BaseModel):
     prompt: str
 
 @app.post("/api/process")
 async def process_data(request: ChatRequest):
     user_input = request.prompt
-    
-    # Bước 1: Tìm trong Vector DB
     context = vector_search_only(user_input)
     
-    # Bước 2: Xử lý Prompt cho AI
     if context:
-        # Trường hợp tìm thấy luật
         system_prompt = f"""
         Bạn là Trợ lý Pháp luật Giao thông Việt Nam (Nghị định 168/2024).
         Dưới đây là thông tin trích xuất từ văn bản luật chính xác:
@@ -107,7 +106,6 @@ async def process_data(request: ChatRequest):
         """
         final_prompt = f"Người dùng hỏi: {user_input}"
     else:
-        # Trường hợp KHÔNG tìm thấy trong Vector (Hỏi ngoài lề hoặc dữ liệu thiếu)
         system_prompt = """
         Bạn là Trợ lý Giao thông.
         Người dùng đang hỏi một câu mà hệ thống dữ liệu luật hiện tại KHÔNG tìm thấy thông tin khớp.
@@ -115,7 +113,6 @@ async def process_data(request: ChatRequest):
         """
         final_prompt = f"Câu hỏi: {user_input}"
 
-    # Bước 3: Gọi Gemini trả lời
     global key_index
     for _ in range(len(GOOGLE_KEYS)):
         try:
