@@ -1,7 +1,8 @@
 fastapi
 uvicorn
+pydantic
 faiss-cpu
 numpy
+python-multipart
 google-generativeai
-duckduckgo_search
 openai
