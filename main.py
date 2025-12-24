@@ -19,13 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. CẤU HÌNH API KEYS (HYBRID)
-
-# A. Key OpenAI (Dùng để TÌM KIẾM - Embedding)
+# 2. CẤU HÌNH API KEYS
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# B. Key Google (Dùng để TRẢ LỜI - Chat Generative)
 GOOGLE_KEYS_STR = os.getenv("GOOGLE_API_KEYS", "")
 GOOGLE_KEYS = [k.strip() for k in GOOGLE_KEYS_STR.split(",") if k.strip()]
 key_index = 0
@@ -38,46 +35,64 @@ def get_current_google_key():
 # 3. Health Check
 @app.get("/")
 def read_root():
-    return {"status": "Hybrid Server is running"}
+    return {"status": "Hybrid Server (Law + Social) is running"}
 
-# 4. Load Database
-print("📥 Đang tải cơ sở dữ liệu luật...")
-index = None
-documents = None
-
-try:
-    if os.path.exists("luat_vn.index") and os.path.exists("luat_vn.pkl"):
-        index = faiss.read_index("luat_vn.index")
-        with open("luat_vn.pkl", "rb") as f:
-            documents = pickle.load(f)
-        print(f"✅ Đã tải xong! Tổng cộng {len(documents)} đoạn luật.")
+# 4. HÀM LOAD DATABASE (Chung cho cả Luật và Xã giao)
+def load_db(name_index, name_pkl):
+    print(f"📥 Đang tải DB: {name_index}...")
+    if os.path.exists(name_index) and os.path.exists(name_pkl):
+        try:
+            idx = faiss.read_index(name_index)
+            with open(name_pkl, "rb") as f:
+                docs = pickle.load(f)
+            print(f"✅ Đã tải xong {name_index}: {len(docs)} đoạn.")
+            return idx, docs
+        except Exception as e:
+            print(f"❌ Lỗi tải {name_index}: {e}")
+            return None, None
     else:
-        print("⚠️ Lỗi: Không tìm thấy file dữ liệu.")
-except Exception as e:
-    print(f"❌ Lỗi khi tải DB: {e}")
+        print(f"⚠️ Không tìm thấy file {name_index} (Bỏ qua).")
+        return None, None
 
-# 5. HÀM TÌM KIẾM (OpenAI Embedding)
+# --- LOAD CẢ 2 DB ---
+index_luat, docs_luat = load_db("luat_vn.index", "luat_vn.pkl")
+index_social, docs_social = load_db("xa_giao.index", "xa_giao.pkl")
+
+# 5. HÀM TÌM KIẾM ĐA NGUỒN (Hybrid Search)
+def search_in_index(idx, docs, query_vec, threshold=0.35, top_k=3):
+    if not idx or not docs: return []
+    scores, indices = idx.search(query_vec, top_k)
+    results = []
+    for i, score in enumerate(scores[0]):
+        if score >= threshold:
+            results.append(docs[indices[0][i]])
+    return results
+
 def vector_search(query):
-    if not index or not documents:
-        return ""
     try:
+        # Mã hóa câu hỏi (Dùng OpenAI)
         response = openai_client.embeddings.create(
             input=query,
             model="text-embedding-3-small"
         )
         q_vec = np.array([response.data[0].embedding]).astype('float32')
         faiss.normalize_L2(q_vec) 
-        scores, indices = index.search(q_vec, 5)
         
-        relevant_docs = []
-        for i, score in enumerate(scores[0]):
-            if score >= 0.35: 
-                relevant_docs.append(documents[indices[0][i]])
+        # 1. Tìm trong XÃ GIAO (Ưu tiên cao, ngưỡng chặt chẽ hơn để tránh nhầm)
+        # Ngưỡng 0.45 để đảm bảo câu xã giao phải khá khớp mới lấy
+        social_results = search_in_index(index_social, docs_social, q_vec, threshold=0.45, top_k=2)
         
-        if relevant_docs:
-            return "\n---\n".join(relevant_docs)
+        # 2. Tìm trong LUẬT (Ngưỡng 0.35)
+        law_results = search_in_index(index_luat, docs_luat, q_vec, threshold=0.35, top_k=5)
+        
+        # Gộp kết quả
+        final_results = social_results + law_results
+        
+        if final_results:
+            return "\n---\n".join(final_results)
         else:
             return ""
+            
     except Exception as e:
         print(f"❌ Lỗi tìm kiếm: {e}")
         return ""
@@ -90,50 +105,51 @@ class ChatRequest(BaseModel):
 async def process_data(request: ChatRequest):
     user_input = request.prompt
     
-    # BƯỚC 1: TÌM KIẾM
+    # BƯỚC A: TÌM KIẾM DỮ LIỆU
     context = vector_search(user_input)
     
-    # BƯỚC 2: XÁC ĐỊNH NGUỒN DỮ LIỆU & CẢNH BÁO
+    # BƯỚC B: CHUẨN BỊ PROMPT
     if context:
-        source_instruction = f"Sử dụng thông tin sau để trả lời:\n{context}"
+        source_instruction = f"DỮ LIỆU TÌM ĐƯỢC TỪ KHO KIẾN THỨC:\n{context}"
         footer_warning = ""
     else:
-        source_instruction = "Hiện tại không tìm thấy trong văn bản luật nạp sẵn. Hãy dùng kiến thức chung của bạn về Luật Giao thông Việt Nam (Nghị định 100/2019, 123/2021) để trả lời."
-        footer_warning = "\n\n⚠️ _Lưu ý: Thông tin này dựa trên kiến thức tổng hợp, bạn nên tra cứu văn bản gốc để đối chiếu._"
+        source_instruction = "Không tìm thấy trong dữ liệu nạp sẵn. Hãy dùng kiến thức chung của bạn về Luật Giao thông (NĐ 100/2019, 123/2021) để trả lời."
+        footer_warning = "\n\n⚠️ _(Thông tin tham khảo từ kiến thức tổng hợp)_"
 
-    # BƯỚC 3: TẠO PROMPT (Cấu hình trình bày đẹp)
     system_prompt = f"""
-    Bạn là Trợ lý AI Giao thông Việt Nam thân thiện và chuyên nghiệp.
+    Bạn là Trợ lý AI Giao thông Việt Nam thông minh, hài hước và am hiểu luật.
 
     {source_instruction}
 
-    QUY TẮC TRÌNH BÀY (BẮT BUỘC TUÂN THỦ):
-    1. **ĐỊNH DẠNG:**
-       - **TUYỆT ĐỐI KHÔNG** dùng dấu sao (*) ở đầu dòng danh sách. Nó gây xấu giao diện.
-       - Hãy dùng dấu gạch ngang (-) hoặc số thứ tự (1., 2.) cho các danh sách.
-       - Dùng **In đậm** (bọc trong 2 dấu sao) cho: Số tiền phạt, Tên lỗi vi phạm, Các từ khóa quan trọng.
-    
-    2. **BỐ CỤC & KHOẢNG CÁCH:**
-       - Giữa các ý chính phải có **một dòng trống** để tạo độ thoáng.
-       - Không viết một đoạn văn quá dài (trên 5 dòng). Hãy ngắt nhỏ ra.
+    HƯỚNG DẪN XỬ LÝ QUAN TRỌNG:
+    1. **PHÂN LOẠI DỮ LIỆU:**
+       - Nếu dữ liệu tìm được có nhãn `[XÃ GIAO]`: Hãy trả lời theo giọng điệu thân thiện, hài hước hoặc "cà khịa" nhẹ nhàng như trong dữ liệu mẫu.
+       - Nếu dữ liệu là LUẬT: Hãy trả lời nghiêm túc, chính xác, ngắn gọn.
+       - Nếu có cả hai: Hãy chào hỏi xã giao trước, sau đó trả lời luật.
 
-    3. **EMOJI & SINH ĐỘNG:**
-       - Luôn thêm Emoji phù hợp (🚗, 🛵, 🛑, 💰, 👮, ⚠️, ✅) vào đầu các ý chính hoặc tiêu đề.
-    
-    4. **NỘI DUNG:**
-       - Đi thẳng vào vấn đề. Không vòng vo.
-       - Nếu câu hỏi về xử phạt: **PHẢI** ghi rõ con số cụ thể (Ví dụ: **2.000.000đ - 3.000.000đ**).
+    2. **QUY TẮC TRÌNH BÀY (MARKDOWN):**
+       - **TUYỆT ĐỐI KHÔNG** dùng dấu sao (*) ở đầu dòng danh sách.
+       - Dùng dấu gạch ngang (-) cho danh sách.
+       - Dùng **In đậm** (bọc trong 2 dấu sao) cho: Số tiền phạt, Tên lỗi, Từ khóa.
+       - Giữa các ý chính phải có **một dòng trống**.
+       - Luôn thêm Emoji (🚗, 🛵, 🛑, 💰, 👮, 😂, 👋) để sinh động.
+
+    3. **NỘI DUNG:**
+       - Nếu là câu hỏi luật: **PHẢI** ghi rõ mức phạt cụ thể (VD: **2.000.000đ**).
+       - Nếu là câu hỏi xã giao/trêu đùa: Hãy đối đáp lại thông minh.
     """
 
-    final_prompt = f"Người dùng hỏi: {user_input} {footer_warning}"
+    final_prompt = f"Người dùng nói: {user_input} {footer_warning}"
 
-    # BƯỚC 4: GỌI GEMINI TRẢ LỜI
+    # BƯỚC C: GỌI GEMINI (Sửa lại model chuẩn 1.5-flash)
     global key_index
     for i in range(len(GOOGLE_KEYS)):
         try:
             current_key = get_current_google_key()
             genai.configure(api_key=current_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            # Lưu ý: Google chưa có bản 2.5-flash public, dùng 1.5-flash là ổn định nhất
+            model = genai.GenerativeModel('gemini-1.5-flash')
             
             response = model.generate_content(f"{system_prompt}\n\n{final_prompt}")
             return {"answer": response.text}
