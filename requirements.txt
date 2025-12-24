@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+faiss-cpu
+numpy
+google-generativeai
+duckduckgo_search
