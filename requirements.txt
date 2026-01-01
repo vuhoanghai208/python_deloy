@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-pydantic
-faiss-cpu
-numpy
-python-multipart
 google-generativeai
 openai
+faiss-cpu
+numpy
+pydantic
+python-multipart
+duckduckgo-search>=6.1.0
