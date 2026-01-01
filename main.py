@@ -149,7 +149,7 @@ async def hybrid_search(query):
 async def call_gemini(api_key, prompt):
     genai.configure(api_key=api_key)
     # Dùng 1.5-flash cho nhanh và ổn định
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
     response = await model.generate_content_async(prompt)
     return response.text
 
