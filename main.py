@@ -36,7 +36,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ================= 2. RATE LIMIT (CHỐNG SPAM) =================
 RATE_LIMIT = {}
-LIMIT = 10       # Cho phép 10 requests
+LIMIT = 50       # Cho phép 10 requests
 WINDOW = 60      # Trong 60 giây (1 phút)
 
 def check_rate_limit(ip):
