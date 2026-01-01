@@ -2,6 +2,6 @@ fastapi
 uvicorn
 faiss-cpu
 numpy
-duckduckgo_search
+ddgs
 google-genai
 openai
