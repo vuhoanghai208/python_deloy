@@ -6,4 +6,4 @@ faiss-cpu
 numpy
 pydantic
 python-multipart
-duckduckgo-search>=6.2.0
+duckduckgo-search>=6.3.0
