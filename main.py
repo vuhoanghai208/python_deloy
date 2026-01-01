@@ -1,162 +1,267 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import faiss
 import pickle
 import numpy as np
 import os
-import google.generativeai as genai
-from openai import OpenAI
 import time
+import asyncio
+import google.generativeai as genai
+from duckduckgo_search import AsyncDDGS  # Tìm kiếm Web bất đồng bộ
+from openai import AsyncOpenAI           # OpenAI bất đồng bộ
 
+# ================= 1. CẤU HÌNH APP & KHÓA API =================
 app = FastAPI()
 
-# 1. Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. CẤU HÌNH API KEYS
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
+# --- Lấy API Keys từ biến môi trường ---
+# 1. Google Gemini Keys (Danh sách nhiều key cách nhau dấu phẩy)
 GOOGLE_KEYS_STR = os.getenv("GOOGLE_API_KEYS", "")
 GOOGLE_KEYS = [k.strip() for k in GOOGLE_KEYS_STR.split(",") if k.strip()]
-key_index = 0
 
-def get_current_google_key():
-    global key_index
-    if not GOOGLE_KEYS: return None
-    return GOOGLE_KEYS[key_index % len(GOOGLE_KEYS)]
+# 2. OpenAI Key (Dùng để Embed và làm Fallback)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    print("⚠️ CẢNH BÁO: Thiếu OPENAI_API_KEY. Chức năng Search và Fallback sẽ lỗi.")
 
-# 3. Health Check
-@app.get("/")
-def read_root():
-    return {"status": "Hybrid Server (Law + Social) is running"}
+# Client OpenAI Async
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# 4. HÀM LOAD DATABASE (Chung cho cả Luật và Xã giao)
-def load_db(name_index, name_pkl):
-    print(f"📥 Đang tải DB: {name_index}...")
-    if os.path.exists(name_index) and os.path.exists(name_pkl):
-        try:
-            idx = faiss.read_index(name_index)
-            with open(name_pkl, "rb") as f:
+# ================= 2. RATE LIMIT (CHỐNG SPAM) =================
+RATE_LIMIT = {}
+LIMIT = 10       # Cho phép 10 requests
+WINDOW = 60      # Trong 60 giây (1 phút)
+
+def check_rate_limit(ip):
+    now = time.time()
+    # Dọn dẹp IP cũ
+    if ip in RATE_LIMIT:
+        RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if now - t < WINDOW]
+        if not RATE_LIMIT[ip]:
+            del RATE_LIMIT[ip]
+            
+    RATE_LIMIT.setdefault(ip, [])
+    if len(RATE_LIMIT.get(ip, [])) >= LIMIT:
+        return False
+    RATE_LIMIT[ip].append(now)
+    return True
+
+# ================= 3. LOAD CƠ SỞ DỮ LIỆU (LUẬT + XÃ GIAO) =================
+def load_faiss_db(index_file, pkl_file):
+    try:
+        if os.path.exists(index_file) and os.path.exists(pkl_file):
+            index = faiss.read_index(index_file)
+            with open(pkl_file, "rb") as f:
                 docs = pickle.load(f)
-            print(f"✅ Đã tải xong {name_index}: {len(docs)} đoạn.")
-            return idx, docs
-        except Exception as e:
-            print(f"❌ Lỗi tải {name_index}: {e}")
+            print(f"✅ Đã tải DB: {index_file} ({len(docs)} docs)")
+            return index, docs
+        else:
+            print(f"⚠️ Không tìm thấy file: {index_file}")
             return None, None
-    else:
-        print(f"⚠️ Không tìm thấy file {name_index} (Bỏ qua).")
+    except Exception as e:
+        print(f"❌ Lỗi tải DB {index_file}: {e}")
         return None, None
 
-# --- LOAD CẢ 2 DB ---
-index_luat, docs_luat = load_db("luat_vn.index", "luat_vn.pkl")
-index_social, docs_social = load_db("xa_giao.index", "xa_giao.pkl")
+# Load cả 2 DB
+index_luat, docs_luat = load_faiss_db("luat_vn.index", "luat_vn.pkl")
+index_social, docs_social = load_faiss_db("xa_giao.index", "xa_giao.pkl")
 
-# 5. HÀM TÌM KIẾM ĐA NGUỒN (Hybrid Search)
-def search_in_index(idx, docs, query_vec, threshold=0.35, top_k=3):
-    if not idx or not docs: return []
-    scores, indices = idx.search(query_vec, top_k)
-    results = []
-    for i, score in enumerate(scores[0]):
-        if score >= threshold:
-            results.append(docs[indices[0][i]])
-    return results
+# ================= 4. CÁC HÀM XỬ LÝ TÌM KIẾM (CORE LOGIC) =================
 
-def vector_search(query):
+# Hàm tạo Vector từ câu hỏi (Dùng OpenAI text-embedding-3-small)
+async def get_embedding_async(text):
+    if not openai_client: return None
     try:
-        # Mã hóa câu hỏi (Dùng OpenAI)
-        response = openai_client.embeddings.create(
-            input=query,
+        resp = await openai_client.embeddings.create(
+            input=text,
             model="text-embedding-3-small"
         )
-        q_vec = np.array([response.data[0].embedding]).astype('float32')
-        faiss.normalize_L2(q_vec) 
-        
-        # 1. Tìm trong XÃ GIAO (Ưu tiên cao, ngưỡng chặt chẽ hơn để tránh nhầm)
-        # Ngưỡng 0.45 để đảm bảo câu xã giao phải khá khớp mới lấy
-        social_results = search_in_index(index_social, docs_social, q_vec, threshold=0.45, top_k=2)
-        
-        # 2. Tìm trong LUẬT (Ngưỡng 0.35)
-        law_results = search_in_index(index_luat, docs_luat, q_vec, threshold=0.35, top_k=5)
-        
-        # Gộp kết quả
-        final_results = social_results + law_results
-        
-        if final_results:
-            return "\n---\n".join(final_results)
-        else:
-            return ""
-            
+        # Chuyển thành numpy array float32 cho FAISS
+        vec = np.array([resp.data[0].embedding]).astype('float32')
+        faiss.normalize_L2(vec) # Chuẩn hóa vector
+        return vec
     except Exception as e:
-        print(f"❌ Lỗi tìm kiếm: {e}")
-        return ""
+        print(f"❌ Lỗi Embedding: {e}")
+        return None
 
-# 6. API Xử lý Chat
+# Hàm tìm kiếm trong index cụ thể
+def search_index(index, docs, vector, top_k=3, threshold=0.0):
+    if not index or not docs or vector is None:
+        return []
+    
+    # Search
+    scores, indices = index.search(vector, top_k)
+    results = []
+    
+    # Lọc kết quả theo ngưỡng (threshold)
+    for i, score in enumerate(scores[0]):
+        if score >= threshold:
+            idx = indices[0][i]
+            if 0 <= idx < len(docs):
+                results.append(docs[idx])
+    return results
+
+# Hàm Tìm kiếm Hỗn hợp (Luật + Xã giao + Web)
+async def hybrid_search(query):
+    context_parts = []
+    
+    # 1. Tạo vector cho câu hỏi
+    q_vec = await get_embedding_async(query)
+
+    # 2. Tìm trong DB XÃ GIAO (Ngưỡng cao để tránh nhầm)
+    # Nếu câu hỏi khớp > 45% với câu xã giao thì lấy
+    social_res = search_index(index_social, docs_social, q_vec, top_k=2, threshold=0.45)
+    if social_res:
+        context_parts.append("[KỊCH BẢN XÃ GIAO/GIAO TIẾP]:\n" + "\n".join(social_res))
+
+    # 3. Tìm trong DB LUẬT (Ngưỡng vừa phải)
+    law_res = search_index(index_luat, docs_luat, q_vec, top_k=5, threshold=0.35)
+    if law_res:
+        context_parts.append("[DỮ LIỆU LUẬT & NGHỊ ĐỊNH]:\n" + "\n".join(law_res))
+
+    # 4. Tìm kiếm Internet (DuckDuckGo) - Chỉ chạy khi không tìm thấy luật trong DB
+    # Hoặc luôn chạy để bổ sung tin tức mới (tùy chọn)
+    if not law_res: 
+        try:
+            ddg_res = await AsyncDDGS().text(
+                f"{query} luật giao thông Việt Nam 2025",
+                max_results=2,
+                region="vn-vn"
+            )
+            if ddg_res:
+                web_text = "\n".join([r['body'] for r in ddg_res])
+                context_parts.append("[THÔNG TIN INTERNET (THAM KHẢO)]:\n" + web_text)
+        except Exception:
+            pass # Lỗi web thì bỏ qua
+
+    return "\n\n---\n\n".join(context_parts)
+
+# ================= 5. GỌI AI (GEMINI -> FALLBACK GPT) =================
+
+# Gọi Google Gemini (Async)
+async def call_gemini(api_key, prompt):
+    genai.configure(api_key=api_key)
+    # Dùng 1.5-flash cho nhanh và ổn định
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = await model.generate_content_async(prompt)
+    return response.text
+
+# Gọi OpenAI GPT (Async) - Dùng làm Fallback
+async def call_gpt_fallback(prompt):
+    if not openai_client:
+        raise RuntimeError("Không có OpenAI Key để chạy Fallback")
+    
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini", # Rẻ và nhanh
+        messages=[
+            {"role": "system", "content": "Bạn là chuyên gia Luật Giao thông VN."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    return response.choices[0].message.content
+
+# ================= 6. API ENDPOINT =================
 class ChatRequest(BaseModel):
     prompt: str
 
 @app.post("/api/process")
-async def process_data(request: ChatRequest):
-    user_input = request.prompt
+async def process_data(req: Request, body: ChatRequest):
+    # 1. Check Rate Limit
+    ip = req.client.host
+    if not check_rate_limit(ip):
+        raise HTTPException(429, "Bạn gửi quá nhiều yêu cầu. Vui lòng đợi 1 phút.")
+
+    user_input = body.prompt.strip()
+    if not user_input:
+        return {"answer": "Bạn chưa nhập câu hỏi nào cả! 😅"}
+
+    # 2. Tìm kiếm dữ liệu (Search)
+    context = await hybrid_search(user_input)
+
+    # 3. Tạo Prompt
+    source_warning = ""
+    if not context:
+        source_warning = "\n⚠️ *Lưu ý: Không tìm thấy dữ liệu trong thư viện. Câu trả lời dựa trên kiến thức tổng hợp của AI.*"
+        
+    system_instruction = """
+    VAI TRÒ: Bạn là Trợ lý AI Cố vấn Pháp luật Giao thông Việt Nam & Bạn đường tin cậy.
     
-    # BƯỚC A: TÌM KIẾM DỮ LIỆU
-    context = vector_search(user_input)
+    NHIỆM VỤ:
+    1. Nếu là câu hỏi XÃ GIAO (Chào hỏi, trêu đùa, hỏi tên...):
+       - Trả lời thân thiện, hài hước, ngắn gọn.
+       
+    2. Nếu là câu hỏi LUẬT/KIẾN THỨC:
+       - Dựa tuyệt đối vào [NGỮ CẢNH THAM KHẢO] bên dưới.
+       - Trích dẫn Nghị định 100/2019 hoặc 123/2021 hoặc 168/2024.
+       - Nêu rõ: Mức phạt tiền (In đậm) và Hình phạt bổ sung (Tước bằng, giam xe...).
+       - Trình bày dạng danh sách (Bullet points) dễ đọc.
     
-    # BƯỚC B: CHUẨN BỊ PROMPT
-    if context:
-        source_instruction = f"DỮ LIỆU TÌM ĐƯỢC TỪ KHO KIẾN THỨC:\n{context}"
-        footer_warning = ""
-    else:
-        source_instruction = "Không tìm thấy trong dữ liệu nạp sẵn. Hãy dùng kiến thức chung của bạn về Luật Giao thông (NĐ 100/2019, 123/2021) để trả lời."
-        footer_warning = "\n\n⚠️ _(Thông tin tham khảo từ kiến thức tổng hợp)_"
-
-    system_prompt = f"""
-    Bạn là Trợ lý AI Giao thông Việt Nam thông minh, hài hước và am hiểu luật.
-
-    {source_instruction}
-
-    HƯỚNG DẪN XỬ LÝ QUAN TRỌNG:
-    1. **PHÂN LOẠI DỮ LIỆU:**
-       - Nếu dữ liệu tìm được có nhãn `[XÃ GIAO]`: Hãy trả lời theo giọng điệu thân thiện, hài hước hoặc "cà khịa" nhẹ nhàng như trong dữ liệu mẫu.
-       - Nếu dữ liệu là LUẬT: Hãy trả lời nghiêm túc, chính xác, ngắn gọn.
-       - Nếu có cả hai: Hãy chào hỏi xã giao trước, sau đó trả lời luật.
-
-    2. **QUY TẮC TRÌNH BÀY (MARKDOWN):**
-       - **TUYỆT ĐỐI KHÔNG** dùng dấu sao (*) ở đầu dòng danh sách.
-       - Dùng dấu gạch ngang (-) cho danh sách.
-       - Dùng **In đậm** (bọc trong 2 dấu sao) cho: Số tiền phạt, Tên lỗi, Từ khóa.
-       - Giữa các ý chính phải có **một dòng trống**.
-       - Luôn thêm Emoji (🚗, 🛵, 🛑, 💰, 👮, 😂, 👋) để sinh động.
-
-    3. **NỘI DUNG:**
-       - Nếu là câu hỏi luật: **PHẢI** ghi rõ mức phạt cụ thể (VD: **2.000.000đ**).
-       - Nếu là câu hỏi xã giao/trêu đùa: Hãy đối đáp lại thông minh.
+    3. NGUYÊN TẮC:
+       - Không bịa đặt mức phạt.
+       - Luôn dùng Emoji (🚗, 👮, 💰) để sinh động.
     """
 
-    final_prompt = f"Người dùng nói: {user_input} {footer_warning}"
+    final_prompt = f"""
+    [SYSTEM]
+    {system_instruction}
 
-    # BƯỚC C: GỌI GEMINI (Sửa lại model chuẩn 1.5-flash)
-    global key_index
-    for i in range(len(GOOGLE_KEYS)):
+    [NGỮ CẢNH THAM KHẢO TỪ DATABASE & INTERNET]
+    {context if context else "Không có dữ liệu cụ thể."}
+
+    [CÂU HỎI NGƯỜI DÙNG]
+    {user_input}
+
+    [TRẢ LỜI]
+    """
+
+    # 4. CHIẾN THUẬT GỌI AI: GEMINI XOAY VÒNG -> GPT FALLBACK
+    
+    # --- GIAI ĐOẠN 1: Thử tất cả key Gemini ---
+    for idx, key in enumerate(GOOGLE_KEYS):
         try:
-            current_key = get_current_google_key()
-            genai.configure(api_key=current_key)
-            
-            # Lưu ý: Google chưa có bản 2.5-flash public, dùng 1.5-flash là ổn định nhất
-            model = genai.GenerativeModel('gemini-2.5-flash')
-            
-            response = model.generate_content(f"{system_prompt}\n\n{final_prompt}")
-            return {"answer": response.text}
-            
+            answer = await call_gemini(key, final_prompt)
+            return {
+                "answer": answer + source_warning,
+                "model": "gemini",
+                "key_used": idx, # Để debug xem đang dùng key nào
+                "status": "success"
+            }
         except Exception as e:
-            print(f"⚠️ Lỗi Gemini (Key {i}): {e}")
-            key_index += 1
-            time.sleep(0.5)
-            
-    return {"answer": "😔 Hệ thống đang quá tải. Bạn vui lòng thử lại sau giây lát nhé!"}
+            print(f"⚠️ Gemini Key {idx} lỗi: {e}. Đang thử key tiếp theo...")
+            continue # Thử key kế tiếp
+
+    # --- GIAI ĐOẠN 2: Nếu tất cả Key Gemini đều lỗi -> Dùng GPT ---
+    print("🚨 TẤT CẢ KEY GEMINI ĐỀU LỖI. CHUYỂN SANG GPT FALLBACK!")
+    try:
+        answer = await call_gpt_fallback(final_prompt)
+        return {
+            "answer": answer + source_warning,
+            "model": "gpt-fallback",
+            "status": "success"
+        }
+    except Exception as e:
+        print(f"❌ GPT Fallback cũng lỗi: {e}")
+        return {
+            "answer": "Hệ thống đang quá tải và bảo trì. Bạn vui lòng thử lại sau 1 phút nhé! 😔",
+            "status": "error"
+        }
+
+# ================= 7. HEALTH CHECK =================
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "mode": "Hybrid (Law + Social)",
+        "gemini_keys": len(GOOGLE_KEYS),
+        "gpt_ready": bool(OPENAI_API_KEY),
+        "db_law": index_luat is not None,
+        "db_social": index_social is not None
+    }
