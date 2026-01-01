@@ -10,7 +10,7 @@ import time
 import asyncio
 
 from google import genai
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from openai import AsyncOpenAI
 
 # ================= 1. APP CONFIG =================
